@@ -1,0 +1,1416 @@
+/*
+One piece of advice before checking the log and understand the program
+read the whole log.
+I, today, face an wonderful problem while checking the log
+I am a dumb obviously. Because, I dont check the full log
+During testing, what happened, is that, client is sending one valid message and 
+is being terminated
+So, in server log, first the message is read and written in queue
+after that, another read event is generated (since the client connection is terminated
+you will get a constant read event generated for that client until you unregister 
+it from selector)
+so, another read event is generated and server side finds the numberOfBytesRead==-1
+So, that means the client has reached end of its stream
+so, it unregisters the key, close socket channel and close SSL engine
+Now, after that, another thread reads from the queue and process the message
+Now, since, I was reading only the last portion of the log,  
+I found is suspecting
+as it seems to me, that the message is read and unwrapped even after the SSLEngine 
+is being closed
+ */
+package ClientConnectionHandler;
+
+import TransportHandler.TransportHandler;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.net.StandardSocketOptions;
+import java.nio.ByteBuffer;
+import java.nio.ReadOnlyBufferException;
+import java.nio.channels.AsynchronousCloseException;
+import java.nio.channels.ClosedByInterruptException;
+import java.nio.channels.NonReadableChannelException;
+import java.nio.channels.ReadableByteChannel;
+import java.nio.channels.SocketChannel;
+import java.security.KeyManagementException;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.UnrecoverableKeyException;
+import java.security.cert.CertificateException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import javax.net.ssl.KeyManager;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLEngineResult;
+import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import serverConfiguration.ServerConfiguration;
+import socketOptions.SocketOptions;
+import putDataFromQueueInDatabaseHandler.PutDataFromQueueInDataBaseHandler;
+
+public class SSLHandler extends ClientConnectionHandler
+{
+
+    static final Logger logger = LogManager.getRootLogger();
+    private static SSLContext servSSLContext = null;
+    private SSLEngine servSSLEngine;
+    //why servSSLengine needs to be created for each incoming client  connection
+    //to differentiate wrap, unwrap events of different handshake
+    private SSLSession sslSessionInstance;
+    private static boolean isCreateSSLContextSuccessful = false;
+    private SocketChannel sock;
+    private final Executor taskWorkers = Executors.newFixedThreadPool(10);
+    private boolean isFatalError;
+    private boolean isBufferOverflow;
+    private boolean isEndOfSocketStreamReached;
+    private boolean isSSLEngineClosed;
+    private ByteBuffer peerNetData;
+    private ByteBuffer myAppData;
+    private ByteBuffer myNetData;
+    private ByteBuffer peerAppData;
+    private ByteBuffer clientWrappedData;
+    private ByteBuffer clientUnWrappedData;
+    private int totalNumberOfBytesToRead;
+    private int totalNumberOfBytesRead;
+    //creating a thread for every delegated task causes CPU utilization
+    //that's why threadPool is better
+    /*During handshake, The SSLEngine might encounter tasks that might block 
+    or take a long time. For example, a trustManager may need to connect to
+    remote certificate validation service. Or, a keymanager might need to determine which certificate
+    to use as part of client authentication. To preserve the non blocking 
+    nature of SSLEngine, , when the engine encounters such a task, it will 
+    return SSLEngineResult.HandshakeStatus.NEED_TASK.
+    Upon receiving this status, the application should invoke 
+    SSLEngine.getDelegatedTask() to get the task, and then, 
+    using the threading model appropriate for its requirements, 
+    process the task.
+    Now,  best is using threadpool for that
+    cause, creting thread in java is complex task and 
+    create thread for each smalll delegated task gives you a lot of overhead
+     */
+    public SSLHandler()
+    {
+        sock = null;
+        servSSLEngine = null;
+        sslSessionInstance = null;
+        isFatalError = false;
+        isBufferOverflow = false;
+        isSSLEngineClosed = false;
+        isEndOfSocketStreamReached = false;
+        peerNetData = null;
+        peerAppData = null;
+        myNetData = null;
+        myAppData = null;
+        totalNumberOfBytesRead=0;
+        totalNumberOfBytesToRead=0;
+    }
+
+    @Override
+    public boolean initClientConnectionHandler(SocketChannel sock)
+    {
+        if (sock == null)
+        {
+            logger.error("The sock passed as argument is null");
+            isFatalError = true;
+            return false;
+        }
+        this.sock = sock;
+        createSSLContext();
+        //if createSSLContext() is unsuccessful
+        if (servSSLContext == null)
+        {
+            logger.error("SSLHandler cannot be initialised as servSSLContext is null");
+            return false;
+        }
+        this.servSSLEngine = servSSLContext.createSSLEngine();
+        //create SSLEngine for every new instance 
+        this.sslSessionInstance = servSSLEngine.getSession();
+        //after allocating it make the buffers clear
+        servSSLEngine.setUseClientMode(false);
+        //Configures the engine to use client (or server) mode when handshaking.
+        servSSLEngine.setNeedClientAuth(true);
+        /*
+            it is only true when servSSLEngine is set in server mode
+            the difference between setNeedClientAuth(true) and setWantClientAuth(true)
+            is that 
+            if the first one is set  and the client chooses not to provide 
+            authentication information about itself, 
+            the negotiations will stop and the engine will begin its closure procedure.
+            if the second one is set, and the client chooses not to provide
+            the authentication about itself, the negotiations will continue.
+         */
+        try
+        {
+            this.servSSLEngine.beginHandshake();
+        }
+        catch (SSLException e)
+        {
+            logger.fatal("A problem was"
+                    + " encountered while signaling the SSLEngine "
+                    + "to begin a new handshake");
+            return false;
+        }
+        catch (IllegalStateException e)
+        {
+            logger.fatal("SSLEngine must set into either client"
+                    + " mode or server mode");
+            return false;
+        }
+        //logger.info("The SSLHadler is initiated successfully");
+        clientWrappedData = ByteBuffer.allocate(TransportHandler.BUFFER_SIZE);
+        //allocated 2k for that
+        clientUnWrappedData = ByteBuffer.allocate(TransportHandler.BUFFER_SIZE);
+        clientWrappedData.clear();
+        clientUnWrappedData.clear();
+        peerAppData = ByteBuffer.allocate(sslSessionInstance.getApplicationBufferSize());
+        peerNetData = ByteBuffer.allocate(sslSessionInstance.getPacketBufferSize());
+        peerAppData.clear();
+        peerNetData.clear();
+        return true;
+    }
+    @Override
+    public boolean setSocketOptions(int sockOpts)
+    {
+        //first two if blocks are for sanity checking
+        if (!sock.isOpen())
+        {
+            logger.error("The socket received from accept function "
+                    + "is closed");
+            isFatalError = true;
+            return false;
+        }
+        if (sock == null)
+        {
+            logger.error("The socket sent as argument to this function has null value");
+            return false;
+        }
+        if ((sockOpts & SocketOptions.SET_REUSEADDR) == SocketOptions.SET_REUSEADDR)
+        {
+            //bitwise operation to check if option is set
+            try
+            {
+                sock.setOption(StandardSocketOptions.SO_REUSEADDR, true);
+            }
+            catch (UnsupportedOperationException e)
+            {
+                logger.error("The socket option provided for Socket "
+                        + "is not suported");
+                return false;
+            }
+            catch (IOException e)
+            {
+                logger.error("The socket option provided for socket "
+                        + "cannot be set as some I/O error happens");
+                return false;
+            }
+        }
+        if ((sockOpts & SocketOptions.SET_NONBLOCKING) == SocketOptions.SET_NONBLOCKING)
+        {
+            try
+            {
+                sock.configureBlocking(false);
+                /*if configureBlocking(false) is set, it would set the socketchannel
+                as non blocking
+                 */
+            }
+            catch (IOException e)
+            {
+                logger.error("The socket cannot be set as non blocking as some"
+                        + " I/O error occurs");
+                return false;
+            }
+        }
+        return true;
+    }
+    @Override
+    public boolean resetSocketOptions(int SocketOpt)
+    {
+        //in this program context, there will be no fatal case
+        //for resetting some socket options
+        if (!sock.isOpen())
+        {
+            logger.fatal("The socket received from accept function "
+                    + "is closed");
+            isFatalError = true;
+            return false;
+        }
+        if (sock == null)
+        {
+            logger.error("The socket sent as argument has null value");
+            return false;
+        }
+        try
+        {
+            if ((SocketOpt & SocketOptions.RESET_REUSEADDR) == SocketOptions.RESET_REUSEADDR)
+            //bitwise operation to check if option is set
+            {
+                if (sock.getOption(StandardSocketOptions.SO_REUSEADDR))
+                {
+                        sock.setOption(StandardSocketOptions.SO_REUSEADDR, false);
+                }
+                else
+                {
+                    logger.info("The socket is not set for "
+                            + "reuseaddressing");
+                    /*we should not return false
+                    suppose, you need to reset SO_REUSEADDR and SO_REUSEADDR
+                    is actually never set, so, program flow/pogram output will
+                    not chsnge
+                    */
+                    //return true;
+                    /*why not retunring true here? because, we might need to set/
+                    reset another option*/
+                }
+            }
+            if ((SocketOpt & SocketOptions.SET_BLOCKING) == SocketOptions.SET_BLOCKING)
+            {
+                if (sock.isBlocking() == false)
+                {
+
+                        sock.configureBlocking(true);
+                }
+                else
+                {
+                    logger.info("The socket is not set for non-blocking");
+                    //return true;
+
+                }
+            }
+            return true;
+        }
+        catch (IOException e)
+        {
+            logger.error("I/O Exception could be happen to the following causes:");
+            logger.error("whether the option SO_REUSEADDR is set or not for the socket");
+            logger.error("Or, I/O error occurs during SO_REUSEADDR is set false");
+            logger.error("Or, I/O error occurs during socket is reset as blocking");
+            return false;
+        }
+        catch (UnsupportedOperationException e)
+        {
+            logger.error("The socket options "
+                    + "provided for Socket"
+                    + " is not suported");
+            return false;
+        }
+        catch (IllegalArgumentException e)
+        {
+            logger.error("The value which is given to set for the option is invalid");
+            return false;
+        }
+    }
+    private void createSSLContext()
+    {
+        if (isCreateSSLContextSuccessful)
+        {
+            return;
+        }
+        if (servSSLContext != null)
+        {
+            return;
+        }
+        KeyStore servKeyStore = null;
+        try
+        {
+            servKeyStore = KeyStore.getInstance("JKS");
+        }
+        catch (KeyStoreException e)
+        {
+            logger.fatal("A new instance of KeyStore:  servKeyStore cannot "
+                    + "be created with the specified type as No Provider supports"
+                    + " a KeyStoreSpi implementation for the specified type");
+            logger.fatal("Check the format specified in the getInstance "
+                    + "function");
+            return;
+        }
+        logger.info("The servKeyStore has been created with the specified "
+                + "type");
+        try
+        {
+            if (servKeyStore != null)
+            {
+                try
+                {
+                    servKeyStore.load(new FileInputStream("ServerKeyStore.jks"), "sayak123".toCharArray());
+                }
+                catch (OutOfMemoryError e)
+                {
+                    logger.fatal("Memory cannot be allocated for Serverkeytore");
+                    System.exit(0);
+                }
+            }
+            else
+            {
+                logger.fatal("servKeyStore's value is null as the program failed to generate"
+                        + " an instance of keystore");
+                return;
+            }
+        }
+        catch (IOException e)
+        {
+            logger.fatal("The newly created "
+                    + "servKeyStore cannot be loaded "
+                    + "with the ClientKeyStore");
+            logger.fatal("Some I/O or format "
+                    + "problem happens with the keystore");
+            logger.fatal("If the error is due "
+                    + "to an incorrect ProtectionParameter "
+                    + "(e.g. wrong password) the cause of the "
+                    + "IOException should be an UnrecoverableKeyException");
+            return;
+        }
+        catch (NoSuchAlgorithmException e)
+        {
+
+            logger.fatal("The newly created "
+                    + "servKeyStore cannot be loaded "
+                    + "with the ClientKeyStore");
+            logger.fatal("The algorithm used "
+                    + "to check the integrity of the keystore cannot"
+                    + " be found");
+            return;
+        }
+        catch (CertificateException e)
+        {
+            logger.fatal("The newly created "
+                    + "servKeyStore cannot be loaded "
+                    + "with the ClientKeyStore");
+            logger.fatal("Any of The certificates in the keystore"
+                    + " could not be loaded");
+            return;
+
+        }
+        logger.info("The newly created servKeyStore is loaded with the "
+                + "ServerKeyStore");
+        KeyManagerFactory servKeyManagerFactory;
+        try
+        {
+            servKeyManagerFactory = KeyManagerFactory.getInstance("SunX509");
+        }
+        catch (NoSuchAlgorithmException e)
+        {
+            logger.fatal("A new instance of "
+                    + "KeyManagerFactory "
+                    + "cannot be created with the specified format "
+                    + "as no Provider "
+                    + "supports a KeyManagerFactorySpi implementation "
+                    + "for the specified algorithm");
+            return;
+        }
+        /*logger.info("servKeyManagerFactory has been created with "
+                + "the specified format");
+         */
+        try
+        {
+            if (servKeyManagerFactory != null)
+            {
+                servKeyManagerFactory.init(servKeyStore, "sayak123".toCharArray());
+            }
+            else
+            {
+                logger.fatal("servKeyManagerFactory is null as the program fails"
+                        + " to generate an instance of servKeyManagerFactory"
+                        + " with the specfied format");
+                return;
+            }
+        }
+        catch (KeyStoreException e)
+        {
+            logger.fatal("the servKeyManagerFactory cannot be "
+                    + "successfully intiliased with the specified KeyStore");
+            return;
+        }
+        catch (NoSuchAlgorithmException e)
+        {
+            logger.fatal("the servKeyManagerFactory cannot be "
+                    + "successfully intiliased with the specified KeyStore");
+            logger.fatal("As the specified "
+                    + "algorithm is not available from the specified provided");
+            return;
+        }
+        catch (UnrecoverableKeyException e)
+        {
+            logger.fatal("the cliKeyManagerFactory cannot be "
+                    + "successfully intiliased with the specified KeyStore");
+            logger.fatal("As the key cannot be recovered"
+                    + " or the given password for the key is wrong");
+            return;
+        }
+        logger.info("The servKeyManagerFactory has been successfully "
+                + "initialised with the specified KeyStore");
+        KeyManager[] km;
+        try
+        {
+            km = servKeyManagerFactory.getKeyManagers();
+        }
+        catch (IllegalStateException e)
+        {
+            logger.fatal("The servKeyManagerFactory is "
+                    + "not initialized");
+            return;
+        }
+        /*logger.info("The servKeyManagerFactory has been successfully "
+                + "initialised");
+         */
+        KeyStore servTrustStore;
+        try
+        {
+            servTrustStore = KeyStore.getInstance("JKS");
+        }
+        catch (KeyStoreException e)
+        {
+            logger.fatal("A new instance of KeyStore:  "
+                    + "cliTrustStore "
+                    + "cannot be created with the specified type as No Provider "
+                    + "supports a KeyStoreSpi implementation for the specified type");
+            logger.fatal("Check the format specified "
+                    + "in the getInstance function");
+            return;
+        }
+        logger.info("The servTrustStore is successfully created with the "
+                + "specified type");
+        try
+        {
+            if (servTrustStore != null)
+            {
+                try
+                {
+                    servTrustStore.load(new FileInputStream("ClientKeyStore.jks"),
+                            "123456".toCharArray());
+                    servTrustStore.load(new FileInputStream("Clientkeystore2.jks"),
+                            "sayak123".toCharArray());
+                }
+                catch (OutOfMemoryError e)
+                {
+                    logger.error("Error in allocating memory fro client key store");
+                    System.exit(0);
+                }
+            }
+            else
+            {
+                logger.fatal("An instance of keystore cannot be generated with the "
+                        + "specified client certificates since servTrustStore is null");
+                return;
+            }
+        }
+        catch (IOException e)
+        {
+            logger.fatal("The newly created "
+                    + "servTrustStore cannot be"
+                    + " loaded with the one of the client's certificate"
+                    + "as some I/O or format "
+                    + "problem happens");
+            logger.fatal("If the error is due "
+                    + "to an incorrect Protection Parameter "
+                    + "(e.g. wrong password) the cause of the "
+                    + "IOException should be an UnrecoverableKeyException");
+            return;
+        }
+        catch (NoSuchAlgorithmException e)
+        {
+            logger.fatal("The newly created "
+                    + "servTrustStore cannot be"
+                    + " loaded with one of the client's certificate");
+            logger.fatal("The algorithm used "
+                    + "to check the integrity of the client certificates cannot"
+                    + " be found");
+            return;
+        }
+        catch (CertificateException e)
+        {
+            logger.fatal("The newly created "
+                    + "servTrustStore cannot be"
+                    + " loaded with one of the client's certificate");
+            logger.fatal("Any of The "
+                    + "certificates in the servTrustStore could not "
+                    + "be loaded");
+            return;
+        }
+        logger.info("The newly created servTrustStore is successfully"
+                + " loaded with the ClientKeyStore");
+        TrustManagerFactory servTrustManagerFactory;
+        try
+        {
+            servTrustManagerFactory = TrustManagerFactory.getInstance("SunX509");
+        }
+        catch (NoSuchAlgorithmException e)
+        {
+            logger.fatal("servTrustManagerFactory cannot be created with "
+                    + "the given type");
+            logger.fatal("TrustManagerFactorySpi "
+                    + "implementation for "
+                    + "the specified algorithm is not available from the "
+                    + "specified Provider object.");
+            return;
+        }
+        catch (IllegalArgumentException e)
+        {
+            logger.fatal("servTrustManagerFactory "
+                    + "cannot be created with "
+                    + "the given type as the provider is null");
+            return;
+        }
+        logger.info("servTrustManagerFactory has been created with the "
+                + "given type");
+        try
+        {
+            if (servTrustManagerFactory != null)
+            {
+                servTrustManagerFactory.init(servTrustStore);
+            }
+            else
+            {
+                logger.fatal("servTrustManagerFactory's value is null as the program"
+                        + " fails to create an instance of the TrustManager with"
+                        + " the specified type");
+                return;
+            }
+        }
+        catch (KeyStoreException e)
+        {
+            logger.fatal("The ServerTrustManagerFactory cannot be "
+                    + "successfully initialised with the specified trust Material");
+            return;
+        }
+        logger.info("the serverTrustManagerFactory has been successfully "
+                + "initialised with the specified trust material");
+        TrustManager[] tm;
+        try
+        {
+            tm = servTrustManagerFactory.getTrustManagers();
+        }
+        catch (IllegalStateException e)
+        {
+            logger.fatal("the servTrustManagerFactory is not initialised");
+            return;
+        }
+        logger.info("The TrustManagerFactory has been successfully initialized");
+        try
+        {
+            servSSLContext = SSLContext.getInstance("TLSv1.2");
+        }
+        catch (NoSuchAlgorithmException e)
+        {
+            logger.fatal("servSSLContext cannot be "
+                    + "created with the specified Secure Socket "
+                    + "Protocol as no Provider supports "
+                    + "a TrustManagerFactorySpi implementation for the specified protocol");
+            return;
+        }
+        logger.info("An instance of SSLContext has been successfully "
+                + "created with specified secure socket protocol");
+        try
+        {
+            if (servSSLContext != null)
+            {
+                servSSLContext.init(km, tm, null);
+            }
+            else
+            {
+                logger.fatal("servSSLContext's value is null");
+                return;
+            }
+        }
+        catch (KeyManagementException e)
+        {
+            logger.fatal("SSLContext cannot be "
+                    + "initialized with the "
+                    + "given trustmanager and keymanager");
+            return;
+        }
+        logger.info("SSLContext is successfully initialized with the "
+                + "given trustmanager and keymanager");
+        logger.info("The SSLContext has been successfully created");
+        isCreateSSLContextSuccessful = true;
+    }
+
+    @Override
+    public SocketChannel returnSocketChannel()
+    {
+        return sock;
+    }
+
+    @Override
+    public void readData()
+    {
+        doHandShake();
+    }
+
+    private void doHandShake()
+    {
+        /*because, suppose,
+        after every read event this function is called
+        I am sure, previous read event data is of no use in new read event
+        that is for clearing during doHandShake()
+        Now, for allocation during every doHandShake()
+        that is suppose, during some wrapping event or unwrapping event
+        some buffers need to be reallocated
+        that's why, we need a fresh start after every read event generation
+         */
+        //logger.info("The function doHandShake is called");
+        myAppData = ByteBuffer.allocate(sslSessionInstance.getApplicationBufferSize());
+        //peerNetData = ByteBuffer.allocate(session.getPacketBufferSize());
+        myNetData = ByteBuffer.allocate(sslSessionInstance.getPacketBufferSize());
+        myAppData.clear();
+        myNetData.clear();
+        SSLEngineResult.HandshakeStatus hs = null;
+        hs = servSSLEngine.getHandshakeStatus();
+        do
+        {
+            switch (hs)
+            {
+                case NEED_UNWRAP:
+                {
+                    //logger.info("The Handshakestatus is NEED_UNWRAP");
+                    handleNeedUnWrapEvent();
+                    if (isFatalError == true)
+                    {
+                        logger.fatal("Fatal Error found in conext of accpepted Socket"
+                                + " connection");
+                        return;
+                    }
+                    break;
+                }
+                case NEED_WRAP:
+                {
+                    //logger.info("The handshakestatus is NEED_WRAP");
+                    handleNeedWrapEvent();
+                    if (isFatalError == true)
+                    {
+                        logger.fatal("Fatal Error found in conext of accpepted Socket"
+                                + " connection");
+                        return;
+                    }
+                    if (isBufferOverflow == true)
+                    {
+                        if (closeSSLEngine())
+                        {
+                            isSSLEngineClosed = true;
+                            isFatalError = true;
+                            logger.fatal("Fatal Error found in conext of accpepted Socket"
+                                    + " connection");
+                            return;
+                        }
+                    }
+                    break;
+                }
+                case NEED_TASK:
+                {
+                    //logger.info("The handshakestatus is NEED_TASK");
+                    handleNeedTaskEvent();
+                    if (isFatalError == true)
+                    {
+                        return;
+                    }
+                    break;
+                }
+                case NOT_HANDSHAKING:
+                {
+                    //logger.info("The handshaking status is NOT_HANDSHAKING");
+                    readFromClient();
+                    if (isEndOfSocketStreamReached == true)
+                    {
+                        if (this.closeSSLEngine())
+                        {
+                            //if SSLEngine can be closed successfully
+                            isFatalError = true;
+                        }
+                    }
+                    break;
+                    //Now, after not_handshanking the status is changed to
+                    //NEED_WRAP
+                    //which is pretty weird staff
+                }
+                case FINISHED:
+                {
+                    //logger.info("The handshake status is FINISHED");
+                    logger.info("Handshake status is finished");
+                    break;
+                }
+                default:
+                {
+                    logger.error("Invalid handshakestatus: " + hs.toString() + " "
+                            + "is generated");
+                    break;
+                }
+            }
+            hs = servSSLEngine.getHandshakeStatus();
+        }
+        while (hs == SSLEngineResult.HandshakeStatus.NEED_WRAP || hs == SSLEngineResult.HandshakeStatus.NEED_TASK);
+        /*
+        Now, check the client flow of wrap and unwrap
+        client                          SSL/TLS message                 HSSTATUS
+        wrap()                          clientHello()                   NEED_UNWRAP
+        unwrap()                        serverHello/cert/
+                                        ServerHelloDone                 NEED_WRAP
+        wrap()                          clientKeyexchange()             NEED_WRAP
+        wrap()                          changecipherspec()              NEED_WRAP
+        wrap()                          Finished                        NEED_UNWRAP
+        unwrap()                        changecipherspec                NEED_UNWRAP
+        unwrap()                        Finished                        FINISHED
+         */
+        /*this is actually flow of rehandshaking
+        as changecipherspec will not be a part of normal handshaking
+         */
+        /*Now, for normal handshaking
+        NEED_UNWRAP
+        NEED_WRAP
+        NEED_WRAP
+        NFINISHED
+         */
+    }
+    private void handleNeedTaskEvent()
+    {
+        //in general,suppose, some parameters of wrap or unwrap is missing
+        /*
+        that parameters will get values after the tasks are executed
+         */
+ /*two cases are needed to check 
+        NEED_TASK
+        NEED_WRAP
+        why
+        NEED_UNWRAP case is not handled?
+        because, NEED_UNWRAP means already you have data, and you need to unwrap it
+        and when data is there, NEED_UNWRAP case is already handled
+         */
+        //logger.info("HandleNeedTaskEvent is called");
+        while (true)
+        {
+            final Runnable sslTask = servSSLEngine.getDelegatedTask();
+            if (sslTask == null)
+            {
+                break;
+            }
+            taskWorkers.execute(sslTask);
+        }
+        SSLEngineResult.HandshakeStatus hs = servSSLEngine.getHandshakeStatus();
+        switch (hs)
+        {
+            case NEED_WRAP:
+            {
+                handleNeedWrapEvent();
+                break;
+            }
+            case NEED_TASK:
+            {
+                handleNeedTaskEvent();
+                break;
+            }
+            default:
+            {
+                logger.debug("Invalid handshake status in current context " + hs.toString());
+                break;
+            }
+        }
+    }
+
+    private void readFromClient()
+    {
+        //logger.info("readFromClient function is called");
+        if (!sock.isOpen())
+        {
+            logger.fatal("The socketchannel is closed");
+            isFatalError = true;
+            return;
+        }
+        int numberOfBytesRead;
+        try
+        {
+            //buffer is cleared before
+            numberOfBytesRead = ((ReadableByteChannel) sock).read(clientWrappedData);
+        }
+        catch(IOException e)
+        {
+            logger.error("SocketChannel cannot be read as some I/O exception "
+                    + "occurs");
+            isFatalError=true;
+            return;
+        }
+        catch (NonReadableChannelException e)
+        {
+            logger.error("SSLServer cannot read"
+                    + " peerData as the channel was not opened for reading");
+            isFatalError=true;
+            return;
+        }
+        if (numberOfBytesRead == -1)
+        {
+            logger.error("The clientSocket has reached end of it's stream");
+            isEndOfSocketStreamReached = true;
+            return;
+        }
+        if (numberOfBytesRead == 0)
+        {
+            logger.error("The number of bytes read is 0");
+            return;
+        }
+        clientWrappedData.flip();
+        //making the limit of the buffer to current position
+        //we can do it , since before next read, we are going to clear that buffer again
+        boolean unWrapOKFlag;
+        SSLEngineResult res;
+        try
+        {
+            //looping is necessary
+            //as we must unwrap the whole application data
+            do
+            {
+                res = servSSLEngine.unwrap(clientWrappedData, clientUnWrappedData);
+                logger.info("The number of bytes produced during unwrap in readFromClient: " + res.bytesProduced()
+                        + " The number of bytes consumed during unwrap in readFromClient: " + res.bytesConsumed());
+                unWrapOKFlag = false;
+                switch (res.getStatus())
+                {
+                    case OK:
+                    {
+                        if (clientWrappedData.position() < clientWrappedData.limit())
+                        {
+                            if (res.bytesConsumed() == 0)
+                            {
+                                //the number of bytesConsumed from the buffer
+                                logger.debug("The current position in clientWrappedData "
+                                        + clientWrappedData.position());
+                                logger.debug("No bytes are consumed from input buffer"
+                                        + " peerNetData");
+                            }
+                            else
+                            {
+                                unWrapOKFlag = true;
+                            }
+                        }
+                    }
+                    break;
+                    case BUFFER_UNDERFLOW:
+                    {
+                        logger.error("The clientWrappedData does not contain "
+                                + "enough bytes to be unwrapped");
+                        return;
+
+                    }
+                    case BUFFER_OVERFLOW:
+                    {
+                        logger.error("The clientUnwrappedData buffer's size is less "
+                                + " than clientWrappedData");
+                        isBufferOverflow = true;
+                        //it would never happen since, we allocate same size for
+                        //both buffer
+                        return;
+                        /*
+                           why return false
+                           we allocate same bufffer size for both of the buffer
+                           this should never happen
+                         */
+                    }
+                    case CLOSED:
+                    {
+                        logger.error("The SSLEngine is closed");
+                        isSSLEngineClosed = true;
+                        isFatalError = true;
+                        return;
+                    }
+                    default:
+                    {
+                        logger.error("Illegal status");
+                        return;
+                    }
+                }
+            }
+            while (unWrapOKFlag == true);
+            /*Now, the first unWrapOKFlag value
+                will be true if full data is not unwrapped
+                so, that loop will terminate when unWrapOKFlag becomes false
+                i.e. clientWrappedData.position==clientWrappedData.Limit()
+                which indicates whole data is  unwrapped
+             */
+            clientUnWrappedData.flip();
+            //make this buffer for read
+            ServerConfiguration servConfigInstance
+                    = ServerConfiguration.getServerConfigurationInstance();
+            int numberOfQueues = servConfigInstance.returnNumberOfQueues();
+            //Now, we are getting a putDataHandler Instance to write data in queue
+            PutDataFromQueueInDataBaseHandler putDataFromQueueInDataBaseHandlerInstance
+                    = PutDataFromQueueInDataBaseHandler.getPutDatafromQueueInDataBaseHandlerInstance(numberOfQueues);
+            putDataFromQueueInDataBaseHandlerInstance.putDataInQueue(clientUnWrappedData);
+            logger.info("total message is read successfully");
+
+            //now, this part is over 
+            //
+            clientUnWrappedData.clear();
+            clientWrappedData.clear();
+        }
+        catch (SSLException e)
+        {
+            logger.error("SSLServer canoot unwrap the peer"
+                    + "netData during handshaking as a problem was encountered"
+                    + " while processing the data that caused the SSLEngine to abort"
+                    + " or clientWrappedData during unwrapping the "
+                    + " buffer for reading  as a problem was encountered "
+                    + " while processing the data that caused the SSLEngine to abort"
+                    + " message from the peer");
+            return;
+        }
+        catch (ReadOnlyBufferException e)
+        {
+            //Now, this can be trated as fatal error
+            //as we will constantly get error
+            logger.error("SSLServer cannot unwrap"
+                    + " the peernetData during handshaking or clientWrappedData"
+                    + " during unwrapping the buffer for reading as the peerAppData buffer is"
+                    + " read-only in the first case or clientUnWrappedData is read only"
+                    + " in the second case");
+            return;
+        }
+        catch (IllegalArgumentException e)
+        {
+            //eliminated by null checking and memory allocating
+            logger.error("SSLServer cannot unwrap"
+                    + " the peerNetData as either peerNetData(source) or "
+                    + "peerAppData(dst) is null"
+                    + " in case of NEED_UNWRAP or cannot unwrap the clientWrappedData"
+                    + " as either clientWrappedData(source) or clientUnWrappedData"
+                    + "(dst) is null");
+            return;
+        }
+    }
+
+    private void handleNeedUnWrapEvent()
+    {
+        //logger.info("HandlerNeedUnWrapEvent is called");
+        int numberOfBytes;
+        try
+        {
+            numberOfBytes = sock.read(peerNetData);
+        }
+        catch (AsynchronousCloseException e)
+        {
+            logger.error("Another thread closes the "
+                    + "channel while the "
+                    + "channel is performing read operation");
+            isFatalError = true;
+            return;
+        }
+        catch (IOException e)
+        {
+            logger.error("The read operation could not"
+                    + " be performed as some"
+                    + " I/O error occurs");
+            isFatalError = true;
+            return;
+        }
+        if (numberOfBytes == -1)
+        {
+            logger.error("The socket has reached end of it's stream");
+            isEndOfSocketStreamReached = true;
+            return;
+        }
+        if (numberOfBytes == 0)
+        {
+            logger.error("no bytes are read");
+            return;
+        }
+        handleNeedUnwrap();
+    }
+
+    private void handleNeedUnwrap()
+    {
+        if (!sock.isOpen())
+        {
+            logger.error("The socket channel is closed");
+            isFatalError = true;
+            return;
+        }
+        SSLEngineResult res;
+        SSLEngineResult.HandshakeStatus hs;
+        //peerNetData.compact();
+        //why compact suppose, after unwrapping some it, it is called again
+        peerNetData.flip();
+        boolean UnWrapOKFlag;
+        //Now, upto this 
+        try
+        {
+            do
+            {
+                UnWrapOKFlag = false;
+                res = servSSLEngine.unwrap(peerNetData, peerAppData);
+                logger.info("The number of bytes produced during unwrap in handleNeedUnWrap: " + res.bytesProduced()
+                        + " The number of bytes consumed during unwrap in handleNeedUnWrap: " + res.bytesConsumed());
+                switch (res.getStatus())
+                {
+                    case OK:
+                    {
+                        logger.info("Unwrap status is ok");
+                        logger.info("SSLServengine can process similar type"
+                                + " of operation");
+                        hs = res.getHandshakeStatus();
+                        switch (hs)
+                        {
+                            case NEED_TASK:
+                            {
+                                logger.info("After unwrapping some client data"
+                                        + " SSLserverengine needs to execute more "
+                                        + "task");
+                                handleNeedTaskEvent();
+                                break;
+                            }
+                            case NEED_WRAP:
+                            {
+                                logger.info("After unwrapping some data NEED_WRAP"
+                                        + " is generated. Hence, server needs to"
+                                        + " wrap some data");
+                                handleNeedWrapEvent();
+                                break;
+                            }
+                            default:
+                            {
+                                break;
+                            }
+                        }
+                        if (peerNetData.position() < peerNetData.limit())
+                        {
+                            if (res.bytesConsumed() == 0)
+                            {
+                                //the number of bytesConsumed from the buffer
+                                logger.debug("The current position in peerNetData "
+                                        + peerNetData.position());
+                                logger.debug("No bytes are consumed from input buffer"
+                                        + " peerNetData");
+                            }
+                            else
+                            {
+                                UnWrapOKFlag = true;
+                            }
+                            //you can unwrap more
+                        }
+                        else
+                        {
+                            /*logger.info("The whole buffer is unwrapped properly"
+                                    + " as peerNetData.position()==peerNetData.limit()");
+                             */
+                        }
+                        /*
+                        do more unwrap and when peerNetData.position() ==peerNetData.limit()
+                        UnwrapOKFlag will be false. So it will break
+                        and go back to handleUnWrapEvent and from there to 
+                        dohandshake() . After all that is the function
+                        which calls this function
+                         */
+                        break;
+                    }
+                    case BUFFER_UNDERFLOW:
+                    {
+                        logger.error("Not enough data in peerNetData to unwrap to a valid"
+                                + "message");
+                        break;
+                        //wait for next READ event in the same socket in selector
+                    }
+                    case BUFFER_OVERFLOW:
+                    {
+                        /*logger.info("The result of unwrap is BUFFER_OVERFLOW");
+                        logger.info("It will try to reallocate the destination buffer"
+                                + " peerAppData and wrap is again");
+                         */
+                        ByteBuffer tempPeerAppData
+                                = ByteBuffer.allocate(sslSessionInstance.getApplicationBufferSize());
+                        peerAppData.rewind();
+                        tempPeerAppData.put(peerAppData);
+                        peerAppData.clear();
+                        peerAppData
+                                = ByteBuffer.allocate(sslSessionInstance.getApplicationBufferSize()
+                                        + (peerNetData.limit() - peerNetData.position()));
+                        peerAppData.clear();
+                        peerAppData.put(tempPeerAppData);
+                        UnWrapOKFlag = true;
+                        break;
+                    }
+                    case CLOSED:
+                    {
+                        logger.error("The SSLEngine is closed");
+                        //now, here, if SSLEngine is closed performing unwrap
+                        //it just cannot do anything
+                        /*
+                        No point checking whether ome more data is needed to unwrap
+                        No point checking whether some more data is needed to unwrap
+                        and obviously no point in trying to read more 
+                        like we try to write the left data during ClOSED
+                        in SSL_WRAP
+                         */
+ /*
+                        Now, that's why isFatalError=true is added 
+                         */
+                        isSSLEngineClosed = true;
+                        isFatalError = true;
+                        break;
+                    }
+                    default:
+                    {
+                        logger.error("Illegal status is generated from unwrapping");
+                        break;
+                    }
+                }
+            }
+            while (UnWrapOKFlag);
+            peerAppData.clear();
+            peerNetData.clear();
+        }
+        catch (SSLException e)
+        {
+            logger.error("SSLServer canoot unwrap the peer"
+                    + "netData during handshaking as a problem was encountered"
+                    + " while processing the data that caused the SSLEngine to abort"
+                    + " or clientWrappedData during unwrapping the "
+                    + " buffer for reading  as a problem was encountered "
+                    + " while processing the data that caused the SSLEngine to abort"
+                    + " message from the peer");
+            return;
+        }
+        catch (ReadOnlyBufferException e)
+        {
+            //Now, this can be trated as fatal error
+            //as we will constantly get error
+            logger.error("SSLServer cannot unwrap"
+                    + " the peernetData during handshaking or clientWrappedData"
+                    + " during unwrapping the buffer for reading as the peerAppData buffer is"
+                    + " read-only in the first case or clientUnWrappedData is read only"
+                    + " in the second case");
+            return;
+        }
+        catch (IllegalArgumentException e)
+        {
+            //eliminated by null checking and memory allocating
+            logger.error("SSLServer cannot unwrap"
+                    + " the peerNetData as either peerNetData(source) or "
+                    + "peerAppData(dst) is null"
+                    + " in case of NEED_UNWRAP or cannot unwrap the clientWrappedData"
+                    + " as either clientWrappedData(source) or clientUnWrappedData"
+                    + "(dst) is null");
+            return;
+        }
+    }
+
+    private void handleNeedWrapEvent()
+    {
+        logger.info("The handleNeedWrapEvent function is called");
+        if (!sock.isOpen())
+        {
+            logger.error("The socket channel is closed");
+            isFatalError = true;
+            return;
+        }
+        myNetData.clear();
+        /*
+        why myNetData.clear() because 
+        first,we write myNetData to client like:
+        while (myNetData.hasRemaining())
+        {
+            if (sock.write(myNetData) < 0)
+            {
+                logger.error("The server side could not send data in response"
+                    + " to client's NEED_WRAP request");
+                return;
+            }
+        }
+        so, we are making sure after the write operation performed
+        myNetData.limit()==myNetData.position()
+         */
+        SSLEngineResult res;
+        try
+        {
+            res = servSSLEngine.wrap(myAppData, myNetData);
+            logger.info("No of Bytes consumed during wrap " + res.bytesConsumed() + " No of"
+                    + " bytes produced during wrap " + res.bytesProduced());
+        }
+        catch (SSLException e)
+        {
+            logger.error("servEngine failed to "
+                    + "wrap as a problem was encountered while processing"
+                    + " the data that caused the SSLEngine to abort");
+            return;
+        }
+        catch (ReadOnlyBufferException e)
+        {
+            logger.error("servEngine failed "
+                    + "to wrap as servNetData buffer is read only");
+            return;
+        }
+        catch (IllegalArgumentException e)
+        {
+            logger.error("servEngine failed "
+                    + " to wrap as either servAppData or servNetData "
+                    + "is null");
+            return;
+        }
+        catch (IllegalStateException e)
+        {
+            logger.error("servEngine failed "
+                    + " to wrap as the client/server mode has not "
+                    + "yet been set");
+            return;
+        }
+        SSLEngineResult.HandshakeStatus hs;
+        switch (res.getStatus())
+        {
+            case OK:
+            {
+                logger.info("The wrapping status is ok");
+                myNetData.flip();
+                //if case is ok, that means we can now send data to the clientSide
+                /*why flip(), because, before sending the buffer we would 
+                set the limit of the buffer to the current position
+                 */
+                try
+                {
+                    while (myNetData.hasRemaining())
+                    {
+                        if (sock.write(myNetData) < 0)
+                        {
+                            logger.error("The server side could not send data in response"
+                                    + " to client's NEED_WRAP request");
+                            return;
+                        }
+                    }
+                    logger.info("Handshaking data is successfully sent to "
+                            + "the client");
+                }
+                catch (IOException e)
+                {
+                    logger.error("The data cannot be sent to client as some I/O error"
+                            + " occurs");
+                    /*no return statement if you think in general cases
+                    as this could be resolved later
+                    However, in case of my program, it will stuck for a long time
+                     */
+                    isFatalError = true;
+                    return;
+                }
+                //now, aftet sending wewill immediately check status
+                //two case could 
+                hs = res.getHandshakeStatus();
+                if (hs == SSLEngineResult.HandshakeStatus.NEED_TASK)
+                {
+                    //Now, suppose some SSL parameters are missed
+                    //immediately one NEED_TASK event will be generated
+                    logger.info("During wrapping some SSL parameters might be missing");
+                    logger.info("Server SSLEngine needs to execute some tasks");
+                    handleNeedTaskEvent();
+                }
+                if (hs == SSLEngineResult.HandshakeStatus.NEED_WRAP)
+                {
+                    //more data is required to wrap
+                    logger.info("Server SSLEngine needs to end more handshaking "
+                            + "data");
+                    handleNeedWrapEvent();
+                }
+                break;
+            }
+            case BUFFER_UNDERFLOW:
+            {
+                logger.error("The myAppData does not contain enough bytes");
+                return;
+            }
+            case BUFFER_OVERFLOW:
+            {
+                logger.error("The myNetData does not contain enough bytes");
+                isBufferOverflow = true;
+                /*
+                why I treat it as FatalError: enough to close the engine
+                because, myAppData is dynamically filled up by the server
+                so, even if I handle the case of BUFFER_OVERFLOW
+                like I handled in NEED_UNWRAP
+                after allocating server might fill more data in peerAppData
+                 */
+                return;
+            }
+            case CLOSED:
+            {
+                logger.debug("The SSLEngine is closed");
+                myNetData.flip();
+                try
+                {
+                    if (sock.write(myNetData) < 0)
+                    {
+                        System.out.println("Couldn't write");
+                    }
+                }
+                catch (IOException e)
+                {
+                    logger.error("MyNetData could not be sent to client due to some"
+                            + " I/O Error occurs");
+                }
+                isSSLEngineClosed = true;
+                isFatalError = true;
+                return;
+                //Now, it is returning from here
+            }
+            default:
+            {
+                logger.error("Illegal status is generated during wrapping");
+            }
+        }
+    }
+
+    @Override
+    public boolean closeConnectionHandler()
+    {
+        boolean closeSocketChannelStatus = closeSocketChannel();
+        boolean closeSSLEngineStatus = closeSSLEngine();
+        /*
+        if the following code is written
+        there is change of an error
+        as if closeSocketChannel returns false
+        closeSSLEngine() will never be called                      
+        if (closeSocketChannel() && closeSSLEngine())
+        {
+        return true;
+        }
+         */
+        return closeSocketChannelStatus && closeSSLEngineStatus;
+    }
+    private boolean closeSocketChannel()
+    {
+        try
+        {
+            if (sock.isOpen())
+            {
+                sock.close();
+            }
+        }
+        catch (IOException e)
+        {
+            logger.error("The Server Socket cannot be "
+                    + "closed successfully");
+            return false;
+        }
+        return true;
+    }
+    private boolean closeSSLEngine()
+    {
+        if (isSSLEngineClosed == true)
+        {
+            return true;
+        }
+        try
+        {
+            servSSLEngine.closeInbound();
+            servSSLEngine.closeOutbound();
+        }
+        catch (SSLException e)
+        {
+            logger.error("The sslengine engine has not received the proper"
+                    + " SSL/TLS close notification message from the peer");
+            return false;
+        }
+        logger.info("The SSLengine is closed successfully");
+        return true;
+    }
+    @Override
+    public boolean returnFatalErrorStatus()
+    {
+        return isFatalError;
+    }
+}
