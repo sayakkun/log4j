@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration>
+    <Properties>
+        <Property name="LOG_DIR">NewMongoDBAccessor.log
+        </Property>
+        <Property name="ARCHIVE">logs/app-%d{MM-dd-yyyy}-%i.log
+        </Property>
+        <Property name="PATTERN">%p %d{dd-MM-yyyy ,HH:mm:ss,SSS} [%t- %F-%L] %m%n</Property>     
+    </Properties>
+    <Appenders>
+        <RollingFile name="RollingFile" fileName="${LOG_DIR}"
+                     filePattern="${ARCHIVE}" append="true">
+            <PatternLayout pattern="${PATTERN}" />
+            <Policies>
+                <SizeBasedTriggeringPolicy size="4 KB" />
+                 </Policies>
+            <DefaultRolloverStrategy max="2" />
+        </RollingFile>
+        <Console name="Console" target="SYSTEM_OUT">
+        </Console>
+    </Appenders>
+    <Loggers>
+        <Root level="DEBUG">
+            <AppenderRef ref="RollingFile"/>
+            <AppenderRef ref="Console"/>
+        </Root>
+    </Loggers>
+</Configuration>
+
+
